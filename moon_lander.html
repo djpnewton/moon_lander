@@ -1,0 +1,533 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Moon Lander</title>
+    <style>
+        canvas { border: 1px solid #222; background: #000; }
+        body { display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; background: #000; }
+        #status { color: white; font-family: Arial, sans-serif; position: absolute; top: 10px; left: 10px; }
+    </style>
+</head>
+<body>
+    <div id="status"></div>
+    <canvas id="gameCanvas" width="800" height="600"></canvas>
+    <script>
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas.getContext('2d');
+        const status = document.getElementById('status');
+
+        // Tuning constants
+        const CONFIG = {
+            gravity: 80,          // px/s^2
+            thrust: 160,          // px/s^2
+            rotationSpeed: 180,   // deg/s
+            fuelBurnRate: 30,     // units/s when thrusting
+            safeVx: 60,           // px/s
+            safeVy: 120,          // px/s
+            safeAngle: 10,        // degrees
+            maxFuel: 200
+        };
+
+    // Platforms
+    const startPad = { x: 80,  y: 550, width: 120, height: 10 };
+    let targetPad = { x: 600, y: 520, width: 110, height: 10, radius: 60, craters: [], anim: { amp: 12, speed: 0.5, phase: 0 } };
+    let obstacles = []; // small moons with gravity
+
+        // Lander state
+        let lander;
+
+        // Game state
+        let gameOver = false;
+        let message = '';
+        let paused = false;
+    let lastTime = null; // ms
+    let time = 0; // seconds, for background and target animation
+    let launched = false; // tracking launch for scoring
+    let startRunTime = 0;
+    let bestScore = Number(localStorage.getItem('moonlander_best') || 0) || 0;
+
+        // Input handling
+        const keys = { up: false, left: false, right: false };
+    document.addEventListener('keydown', (e) => {
+            if (e.key === 'ArrowUp') keys.up = true;
+            if (e.key === 'ArrowLeft') keys.left = true;
+            if (e.key === 'ArrowRight') keys.right = true;
+            if (e.key === ' ' || e.code === 'Space') {
+                if (gameOver) { gameOver = false; message = ''; randomizeTarget(); resetLander(); lastTime = null; }
+            }
+            if (e.key.toLowerCase() === 'p') { paused = !paused; }
+        });
+        document.addEventListener('keyup', (e) => {
+            if (e.key === 'ArrowUp') keys.up = false;
+            if (e.key === 'ArrowLeft') keys.left = false;
+            if (e.key === 'ArrowRight') keys.right = false;
+        });
+        canvas.addEventListener('click', () => {
+            if (gameOver) { gameOver = false; message = ''; randomizeTarget(); resetLander(); lastTime = null; }
+        });
+
+        // Background stars
+        const stars = Array.from({ length: 120 }, () => ({
+            x: Math.random() * canvas.width,
+            y: Math.random() * canvas.height,
+            r: Math.random() * 1.6 + 0.3,
+            a: Math.random() * 0.5 + 0.5,
+            tw: Math.random() * 1.2 + 0.4, // twinkle speed
+            ph: Math.random() * Math.PI * 2   // twinkle phase
+        }));
+
+        // Nebula layers (pre-rendered)
+        const nebulaBG = createNebulaLayer(canvas.width, canvas.height, 18);
+        const nebulaFG = createNebulaLayer(canvas.width, canvas.height, 10, true);
+
+        function rand(min, max) { return Math.random() * (max - min) + min; }
+
+        function createNebulaLayer(w, h, blobs, vivid = false) {
+            const off = document.createElement('canvas');
+            off.width = w; off.height = h;
+            const cx = off.getContext('2d');
+            // Very dark base to soften blends
+            const base = cx.createLinearGradient(0, 0, w, h);
+            base.addColorStop(0, '#03030a');
+            base.addColorStop(1, '#050512');
+            cx.fillStyle = base;
+            cx.fillRect(0, 0, w, h);
+
+            cx.globalCompositeOperation = 'lighter';
+            for (let i = 0; i < blobs; i++) {
+                const x = Math.random() * w;
+                const y = Math.random() * h;
+                const r = rand(w * 0.12, w * 0.35);
+                // Choose color palette
+                const palettes = vivid
+                    ? ['#4ecdc4', '#c56cf0', '#00d2d3', '#ff6b6b', '#54a0ff', '#5f27cd']
+                    : ['#2e86de', '#6c5ce7', '#8e44ad', '#0984e3', '#00cec9'];
+                const c = palettes[Math.floor(Math.random() * palettes.length)];
+                const g = cx.createRadialGradient(x, y, r * 0.1, x, y, r);
+                // Outer transparent, inner semi opaque
+                g.addColorStop(0.0, hexToRgba(c, vivid ? 0.25 : 0.18));
+                g.addColorStop(0.5, hexToRgba(c, vivid ? 0.12 : 0.08));
+                g.addColorStop(1.0, hexToRgba(c, 0.0));
+                cx.fillStyle = g;
+                cx.beginPath();
+                cx.arc(x, y, r, 0, Math.PI * 2);
+                cx.fill();
+            }
+            cx.globalCompositeOperation = 'source-over';
+            return off;
+        }
+
+        function hexToRgba(hex, a) {
+            const m = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
+            if (!m) return `rgba(255,255,255,${a})`;
+            const r = parseInt(m[1], 16), g = parseInt(m[2], 16), b = parseInt(m[3], 16);
+            return `rgba(${r},${g},${b},${a})`;
+        }
+
+        function randomizeTarget() {
+            const minMargin = 60;
+            const r = Math.floor(rand(48, 84)); // moon radius
+            const padW = Math.floor(r * 1.6);   // landing zone width relative to moon
+            const padH = 10;
+            // X range away from start pad
+            const minX = Math.max(minMargin, startPad.x + startPad.width + 100);
+            const maxX = canvas.width - padW - minMargin;
+            const x = Math.floor(rand(minX, Math.max(minX + 1, maxX)));
+            // Y places top somewhere reasonable
+            const topY = Math.floor(rand(330, 540));
+            const anim = { amp: rand(8, 26), speed: rand(0.3, 0.8), phase: rand(0, Math.PI * 2) };
+            targetPad = { x, y: topY, width: padW, height: padH, radius: r, craters: [], anim };
+            // Generate craters
+            const craterCount = Math.floor(rand(5, 10));
+            for (let i = 0; i < craterCount; i++) {
+                // polar coords within 0.75r to avoid edges
+                const rr = rand(r * 0.15, r * 0.35);
+                const ang = rand(0, Math.PI * 2);
+                const dist = rand(r * 0.1, r * 0.7);
+                const cx = x + padW / 2 + Math.cos(ang) * dist;
+                const cy = topY + r + Math.sin(ang) * dist;
+                targetPad.craters.push({ x: cx, y: cy, r: rr });
+            }
+            // Obstacles
+            obstacles = [];
+            const obsCount = Math.floor(rand(2, 4));
+            for (let i = 0; i < obsCount; i++) {
+                const or = rand(18, 36);
+                // choose x/y not overlapping the pads region
+                const ox = rand(60, canvas.width - 60);
+                const oy = rand(120, 360);
+                // avoid being above start/target horizontally directly (optional)
+                obstacles.push({ x: ox, y: oy, r: or, grav: rand(14000, 32000) });
+            }
+        }
+
+        function resetLander() {
+            const startX = startPad.x + (startPad.width - 20) / 2;
+            const startY = startPad.y - 30 - 2;
+            lander = {
+                x: startX,
+                y: startY,
+                vx: 0,
+                vy: 0,
+                angle: 0,           // degrees
+                fuel: CONFIG.maxFuel,
+                width: 20,
+                height: 30
+            };
+            launched = false;
+        }
+
+        function update(dt) {
+            if (paused || gameOver) return;
+
+            // Thrust and rotation
+            let thrustAccel = 0;
+            if (keys.up && lander.fuel > 0) {
+                thrustAccel = CONFIG.thrust;
+                lander.fuel = Math.max(0, lander.fuel - CONFIG.fuelBurnRate * dt);
+            }
+            if (keys.left) lander.angle += CONFIG.rotationSpeed * dt;
+            if (keys.right) lander.angle -= CONFIG.rotationSpeed * dt;
+            lander.angle = ((lander.angle + 180) % 360) - 180; // normalize
+
+            // Physics
+            const rad = lander.angle * Math.PI / 180;
+            const ax = thrustAccel * Math.sin(rad);
+            const ay = CONFIG.gravity - thrustAccel * Math.cos(rad);
+            lander.vx += ax * dt;
+            lander.vy += ay * dt;
+            lander.x += lander.vx * dt;
+            lander.y += lander.vy * dt;
+
+            // Mark launch start (first time we leave the start pad area)
+            if (!launched) {
+                const onStart = (lander.y + lander.height >= startPad.y - 0.1) &&
+                                (lander.x + lander.width / 2 > startPad.x) &&
+                                (lander.x + lander.width / 2 < startPad.x + startPad.width);
+                if (!onStart) { launched = true; startRunTime = time; }
+            }
+
+            // Bounds
+            if (lander.x < 0) { lander.x = 0; lander.vx = 0; }
+            if (lander.x > canvas.width - lander.width) { lander.x = canvas.width - lander.width; lander.vx = 0; }
+            if (lander.y < 0) { lander.y = 0; lander.vy = 0; }
+
+            // Collisions
+            const bottomY = lander.y + lander.height;
+            const centerX = lander.x + lander.width / 2;
+            const overStart = centerX > startPad.x && centerX < startPad.x + startPad.width;
+            // Animated target top
+            const targetTop = targetPad.y + Math.sin(time * targetPad.anim.speed + targetPad.anim.phase) * targetPad.anim.amp;
+            const overTarget = centerX > targetPad.x && centerX < targetPad.x + targetPad.width;
+
+            // Land on moon's flat top (win/lose based on speed/angle)
+            if (bottomY >= targetTop && overTarget) {
+                lander.y = targetTop - lander.height;
+                if (Math.abs(lander.vy) > CONFIG.safeVy || Math.abs(lander.vx) > CONFIG.safeVx || Math.abs(lander.angle) > CONFIG.safeAngle) {
+                    message = 'Crashed on Target! Too fast or tilted.';
+                } else {
+                    const elapsed = launched ? (time - startRunTime) : 0;
+                    const score = Math.max(0, Math.round(10000 - elapsed * 200 - (CONFIG.maxFuel - lander.fuel) * 20));
+                    bestScore = Math.max(bestScore, score);
+                    localStorage.setItem('moonlander_best', String(bestScore));
+                    message = `Landed Successfully! Score ${score} (best ${bestScore})`;
+                }
+                gameOver = true;
+                lander.vx = 0; lander.vy = 0;
+                return;
+            }
+
+            // Rest on start pad (no fail)
+            if (bottomY >= startPad.y && overStart) {
+                lander.y = startPad.y - lander.height;
+                lander.vy = 0;
+                if (!(keys.up && lander.fuel > 0)) lander.vx *= 0.9;
+            }
+            // Obstacles gravity and collision
+            for (const ob of obstacles) {
+                const bx = lander.x + lander.width / 2;
+                const by = lander.y + lander.height / 2;
+                const dx = ob.x - bx;
+                const dy = ob.y - by;
+                const d2 = Math.max(100, dx * dx + dy * dy); // clamp to avoid singularity
+                const invD = 1 / Math.sqrt(d2);
+                const axg = (ob.grav / d2) * dx * invD;
+                const ayg = (ob.grav / d2) * dy * invD;
+                lander.vx += axg * dt;
+                lander.vy += ayg * dt;
+                // collision (bottom center vs radius)
+                const bcx = lander.x + lander.width / 2;
+                const bcy = lander.y + lander.height;
+                const cd2 = (bcx - ob.x) ** 2 + (bcy - ob.y) ** 2;
+                if (cd2 <= ob.r * ob.r) {
+                    message = 'Crashed into a moon!';
+                    gameOver = true;
+                    return;
+                }
+            }
+
+            // Ground crash
+            if (lander.y + lander.height >= canvas.height) {
+                message = 'Crashed on Terrain!';
+                gameOver = true;
+            }
+        }
+
+        // Draw a moon body helper
+        function drawMoonBody(ctx, cx, cy, r) {
+            const g = ctx.createRadialGradient(cx - r * 0.4, cy - r * 0.5, r * 0.2, cx, cy, r);
+            g.addColorStop(0, '#d9dadb');
+            g.addColorStop(0.6, '#bdbec1');
+            g.addColorStop(1, '#8f9399');
+            ctx.fillStyle = g;
+            ctx.beginPath();
+            ctx.arc(cx, cy, r, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.strokeStyle = 'rgba(255,255,255,0.25)';
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            ctx.arc(cx, cy, r - 1, Math.PI * 1.05, Math.PI * 1.45);
+            ctx.stroke();
+        }
+
+        // Draw the target as a moon with craters; the flat top is the landing zone at targetPad.y
+        function drawMoonTarget(ctx, target, t) {
+            const { x, y, width: padW, radius: r, craters, anim } = target;
+            const top = y + Math.sin(t * anim.speed + anim.phase) * anim.amp;
+            const cx = x + padW / 2;
+            const cy = top + r; // circle center so that animated top touches top
+
+            drawMoonBody(ctx, cx, cy, r);
+
+            // Craters
+            for (const cr of craters) {
+                const cg = ctx.createRadialGradient(cr.x - cr.r * 0.3, cr.y - cr.r * 0.3, cr.r * 0.3, cr.x, cr.y, cr.r);
+                cg.addColorStop(0, 'rgba(0,0,0,0.25)');
+                cg.addColorStop(1, 'rgba(255,255,255,0.05)');
+                ctx.fillStyle = cg;
+                ctx.beginPath();
+                ctx.arc(cr.x, cr.y + (top - y), cr.r, 0, Math.PI * 2);
+                ctx.fill();
+            }
+
+            // Flat landing zone glow (follows animated top)
+            const glow = ctx.createLinearGradient(x, top, x, top + 8);
+            glow.addColorStop(0, 'rgba(255,255,255,0.25)');
+            glow.addColorStop(1, 'rgba(255,255,255,0)');
+            ctx.fillStyle = glow;
+            ctx.fillRect(x, top - 1, padW, 6);
+        }
+
+        // Draw rocket centered at origin with up = -Y
+        function drawRocket(ctx, w, h, thrusting) {
+            const grad = ctx.createLinearGradient(0, -h / 2, 0, h / 2);
+            grad.addColorStop(0, '#f8f9fa');
+            grad.addColorStop(0.5, '#e0e3e7');
+            grad.addColorStop(1, '#c7ccd3');
+            ctx.fillStyle = grad;
+            ctx.strokeStyle = '#999';
+            ctx.lineWidth = 1;
+
+            // Body
+            const r = Math.max(2, w * 0.45);
+            ctx.beginPath();
+            ctx.moveTo(-r, -h / 2 + r);
+            ctx.arc(0, -h / 2 + r, r, Math.PI, 0);
+            ctx.lineTo(w / 2, h / 2 - w * 0.20);
+            ctx.quadraticCurveTo(0, h / 2, -w / 2, h / 2 - w * 0.20);
+            ctx.closePath();
+            ctx.fill();
+            ctx.stroke();
+
+            // Window
+            const wx = 0, wy = -h * 0.22, wr = Math.max(2, w * 0.18);
+            ctx.beginPath();
+            ctx.arc(wx, wy, wr, 0, Math.PI * 2);
+            const win = ctx.createRadialGradient(wx - wr * 0.3, wy - wr * 0.3, wr * 0.2, wx, wy, wr);
+            win.addColorStop(0, '#c6e7ff');
+            win.addColorStop(1, '#2d6cdf');
+            ctx.fillStyle = win;
+            ctx.fill();
+            ctx.strokeStyle = '#7aa5d8';
+            ctx.stroke();
+
+            // Stripe
+            ctx.fillStyle = '#d35400';
+            ctx.fillRect(-w / 2, 0, w, Math.max(2, h * 0.06));
+
+            // Legs
+            ctx.strokeStyle = '#bbb';
+            ctx.lineWidth = 2;
+            const legY = h / 2 - 2;
+            ctx.beginPath();
+            ctx.moveTo(-w * 0.28, h * 0.12);
+            ctx.lineTo(-w * 0.55, legY);
+            ctx.moveTo(w * 0.28, h * 0.12);
+            ctx.lineTo(w * 0.55, legY);
+            ctx.stroke();
+            ctx.lineWidth = 3;
+            ctx.beginPath();
+            ctx.moveTo(-w * 0.65, legY);
+            ctx.lineTo(-w * 0.45, legY);
+            ctx.moveTo(w * 0.65, legY);
+            ctx.lineTo(w * 0.45, legY);
+            ctx.stroke();
+
+            // Engine bell
+            ctx.fillStyle = '#666';
+            ctx.beginPath();
+            ctx.moveTo(-w * 0.18, h * 0.38);
+            ctx.lineTo(w * 0.18, h * 0.38);
+            ctx.lineTo(w * 0.28, h * 0.55);
+            ctx.lineTo(-w * 0.28, h * 0.55);
+            ctx.closePath();
+            ctx.fill();
+
+            // Flame
+            if (thrusting) {
+                const flameH = 12 + Math.random() * 12;
+                ctx.beginPath();
+                ctx.moveTo(0, h * 0.55 + flameH);
+                ctx.lineTo(w * 0.18, h * 0.55);
+                ctx.lineTo(-w * 0.18, h * 0.55);
+                ctx.closePath();
+                const grd = ctx.createLinearGradient(0, h * 0.55, 0, h * 0.55 + flameH);
+                grd.addColorStop(0, 'rgba(255,200,0,0.9)');
+                grd.addColorStop(0.6, 'rgba(255,120,0,0.8)');
+                grd.addColorStop(1, 'rgba(255,0,0,0.7)');
+                ctx.fillStyle = grd;
+                ctx.fill();
+            }
+        }
+
+        function draw() {
+            // Clear
+            ctx.fillStyle = 'black';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+            // Nebula background with subtle pulse and drift
+            const pulse = 0.85 + 0.15 * Math.sin(time * 0.2);
+            ctx.globalAlpha = pulse;
+            ctx.drawImage(nebulaBG, 0, 0);
+            // Foreground nebula slight drift
+            const dx = Math.sin(time * 0.05) * 10;
+            const dy = Math.cos(time * 0.04) * 6;
+            ctx.globalAlpha = 0.5 + 0.15 * Math.sin(time * 0.3 + 1.1);
+            ctx.drawImage(nebulaFG, dx, dy);
+            ctx.globalAlpha = 1;
+
+            // Stars
+            for (const s of stars) {
+                const tw = 0.6 + 0.4 * Math.sin(time * s.tw + s.ph);
+                ctx.globalAlpha = s.a * tw;
+                ctx.fillStyle = '#fff';
+                ctx.beginPath();
+                ctx.arc(s.x, s.y, s.r, 0, Math.PI * 2);
+                ctx.fill();
+            }
+            ctx.globalAlpha = 1;
+
+            // Platforms
+            ctx.fillStyle = '#2e86de';
+            ctx.fillRect(startPad.x, startPad.y, startPad.width, startPad.height);
+            ctx.fillStyle = '#a9c7f7';
+            ctx.font = '12px Arial';
+            ctx.fillText('START', startPad.x + 8, startPad.y - 6);
+
+            // Target moon drawing (circle touching the landing zone top)
+            drawMoonTarget(ctx, targetPad, time);
+            ctx.fillStyle = '#b7f7d2';
+            ctx.fillText('TARGET', targetPad.x + 8, targetPad.y - 6);
+
+            // Draw obstacles (small moons)
+            for (const ob of obstacles) {
+                drawMoonBody(ctx, ob.x, ob.y, ob.r);
+            }
+
+            // Lander
+            ctx.save();
+            ctx.translate(lander.x + lander.width / 2, lander.y + lander.height / 2);
+            ctx.rotate(lander.angle * Math.PI / 180);
+            drawRocket(ctx, lander.width, lander.height, keys.up && lander.fuel > 0);
+            ctx.restore();
+
+            // Shadow (nearest surface)
+            const cx = lander.x + lander.width / 2;
+            const surfaces = [];
+            if (cx > startPad.x && cx < startPad.x + startPad.width) surfaces.push(startPad.y);
+            if (cx > targetPad.x && cx < targetPad.x + targetPad.width) {
+                const targetTop = targetPad.y + Math.sin(time * targetPad.anim.speed + targetPad.anim.phase) * targetPad.anim.amp;
+                surfaces.push(targetTop);
+            }
+            surfaces.push(canvas.height);
+            const surfaceY = Math.min(...surfaces);
+            const altitudePx = Math.max(0, surfaceY - (lander.y + lander.height));
+            const shadowAlpha = Math.max(0, 1 - altitudePx / 200);
+            const shadowW = lander.width * (1.2 + Math.min(1, 200 / (altitudePx + 1)));
+            const shadowH = 6;
+            const sx = lander.x + lander.width / 2;
+            const sy = Math.min(surfaceY + 2, lander.y + lander.height + 10);
+            ctx.save();
+            ctx.globalAlpha = 0.25 * shadowAlpha;
+            ctx.fillStyle = '#000';
+            ctx.beginPath();
+            ctx.ellipse(sx, sy, shadowW, shadowH, 0, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.restore();
+
+            // HUD
+            const vxOk = Math.abs(lander.vx) <= CONFIG.safeVx;
+            const vyOk = Math.abs(lander.vy) <= CONFIG.safeVy;
+            const angleOk = Math.abs(lander.angle) <= CONFIG.safeAngle;
+            status.innerHTML = `Fuel: ${Math.floor(lander.fuel)} | Alt: ${altitudePx.toFixed(0)} | Best: ${bestScore} | ` +
+                `Vx: <span style="color:${vxOk ? '#9f9' : '#f99'}">${lander.vx.toFixed(1)}</span> | ` +
+                `Vy: <span style=\"color:${vyOk ? '#9f9' : '#f99'}\">${lander.vy.toFixed(1)}</span> | ` +
+                `Angle: <span style=\"color:${angleOk ? '#9f9' : '#f99'}\">${Math.floor(lander.angle)}°</span>`;
+
+            // Fuel bar
+            const barW = 150, barH = 10, barX = canvas.width - barW - 20, barY = 20;
+            ctx.strokeStyle = '#888';
+            ctx.strokeRect(barX, barY, barW, barH);
+            const fuelFrac = Math.max(0, Math.min(1, lander.fuel / CONFIG.maxFuel));
+            ctx.fillStyle = fuelFrac > 0.3 ? '#2ecc71' : fuelFrac > 0.1 ? '#f1c40f' : '#e74c3c';
+            ctx.fillRect(barX, barY, barW * fuelFrac, barH);
+
+            if (gameOver) {
+                ctx.fillStyle = 'white';
+                ctx.font = '30px Arial';
+                const text = `${message}`;
+                const restart = 'Press Space or Click to Restart';
+                const w1 = ctx.measureText(text).width;
+                const w2 = ctx.measureText(restart).width;
+                ctx.fillText(text, (canvas.width - w1) / 2, canvas.height / 2);
+                ctx.font = '18px Arial';
+                ctx.fillText(restart, (canvas.width - w2) / 2, canvas.height / 2 + 30);
+            } else if (paused) {
+                ctx.fillStyle = 'white';
+                ctx.font = '24px Arial';
+                const p = 'Paused (press P to resume)';
+                const wp = ctx.measureText(p).width;
+                ctx.fillText(p, (canvas.width - wp) / 2, canvas.height / 2);
+            }
+        }
+
+        function gameLoop(ts) {
+            if (lastTime === null) lastTime = ts;
+            let dt = (ts - lastTime) / 1000; // s
+            lastTime = ts;
+            dt = Math.min(dt, 0.05);
+            time += dt;
+            update(dt);
+            draw();
+            requestAnimationFrame(gameLoop);
+        }
+
+    // Start game
+    randomizeTarget();
+    resetLander();
+        gameLoop(0);
+    </script>
+</body>
+</html>
